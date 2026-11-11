@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+claude-merge-sessions —— 合并 Claude 桌面 App 多个账号之间 Code 侧边栏的会话列表
+
+原理
+  桌面 App 按「账号/组织」分别保存侧边栏的会话索引：
+    ~/Library/Application Support/Claude/claude-code-sessions/<账号UUID>/<组织UUID>/local_<会话ID>.json
+  真正的对话内容 (~/.claude/projects/**/<cliSessionId>.jsonl) 是各账号共用的，
+  所以只要把这些 local_*.json 在各账号目录之间互相补齐、以最新版本为准，
+  切换账号后左侧会话栏看到的就是同一份。
+
+合并规则
+  * 同一个会话在多处都有 → 以文件修改时间最新的那份为准（相同再比 lastActivityAt）。
+  * 在某个账号里删掉的会话（deleted_<id> 墓碑比所有副本都新）→ 其它账号里也移除（先备份）。
+  * 归档、星标/置顶、标题都跟着会话文件走；archived-sessions.idx 按合并后的结果重建。
+  * App 正在运行时，默认不改「当前登录账号」的目录（免得和 App 内存里的状态打架），
+    只把内容补到其它账号。所以用法就是：切换账号之前跑一下。
+    退出 App（⌘Q）后再跑，则是完全双向合并。
+  * 每次改动前都会备份到 ~/.claude-session-merge/backups/<时间>/，可用 --undo 撤销。
+  * 不合并：定时任务(scheduled-tasks.json)、backlog、侧边栏分组/排序这类显示偏好。
+
+用法
+  claude-merge-sessions              # 合并（会先备份）
+  claude-merge-sessions --dry-run    # 只看会改什么，不动文件
+  claude-merge-sessions --undo       # 撤销最近一次合并
+  claude-merge-sessions --undo 20261111-013000   # 撤销指定的那次
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+APP_ROOT = os.path.expanduser("~/Library/Application Support/Claude")
+BACKUP_ROOT = os.path.expanduser("~/.claude-session-merge/backups")
+APP_BINARY_SUFFIX = "/Claude.app/Contents/MacOS/Claude"
+
+UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+SESSION_RE = re.compile(r"^local_(" + UUID + r")\.json$")
+TOMB_RE = re.compile(r"^deleted_(" + UUID + r")$")
+IDX_NAME = "archived-sessions.idx"
+
+
+def short(rel):
+    acct, org = rel.split("/")
+    return acct[:8] + "…/" + org[:8] + "…"
+
+
+def session_name(uid):
+    return "local_" + uid + ".json"
+
+
+def tomb_name(uid):
+    return "deleted_" + uid
+
+
+# ---------------------------------------------------------------- 扫描
+
+class DirState(object):
+    def __init__(self, sess_root, rel):
+        self.rel = rel
+        self.acct = rel.split("/")[0]
+        self.path = os.path.join(sess_root, rel)
+        self.sessions = {}   # uid -> dict(path, mtime_ns, activity, archived, title)
+        self.tombs = {}      # uid -> dict(path, ts)
+        self.broken = set()  # 读不出来的会话（可能 App 正在写），本次整体跳过
+        self.deferred = False
+
+    def scan(self):
+        for name in os.listdir(self.path):
+            p = os.path.join(self.path, name)
+            m = SESSION_RE.match(name)
+            if m:
+                uid = m.group(1)
+                try:
+                    with open(p, "rb") as f:
+                        data = json.loads(f.read().decode("utf-8"))
+                    st = os.stat(p)
+                except (ValueError, OSError):
+                    self.broken.add(uid)
+                    continue
+                self.sessions[uid] = dict(
+                    path=p,
+                    mtime_ns=st.st_mtime_ns,
+                    activity=data.get("lastActivityAt") or 0,
+                    archived=bool(data.get("isArchived")),
+                    title=data.get("title") or "",
+                )
+                continue
+            m = TOMB_RE.match(name)
+            if m:
+                uid = m.group(1)
+                try:
+                    with open(p) as f:
+                        ts = int(f.read().strip())
+                except (ValueError, OSError):
+                    ts = int(os.path.getmtime(p) * 1000)
+                self.tombs[uid] = dict(path=p, ts=ts)
+
+
+def discover(sess_root):
+    rels = []
+    for acct in sorted(os.listdir(sess_root)):
+        ap = os.path.join(sess_root, acct)
+        if not (re.match("^" + UUID + "$", acct) and os.path.isdir(ap)):
+            continue
+        for org in sorted(os.listdir(ap)):
+            if re.match("^" + UUID + "$", org) and os.path.isdir(os.path.join(ap, org)):
+                rels.append(acct + "/" + org)
+    return rels
+
+
+def app_is_running():
+    try:
+        out = subprocess.check_output(["ps", "-axo", "comm"], universal_newlines=True)
+    except (OSError, subprocess.CalledProcessError):
+        return True  # 判断不了就按「在运行」处理，更保守
+    return any(line.strip().endswith(APP_BINARY_SUFFIX) for line in out.splitlines())
+
+
+def active_account(app_root):
+    try:
+        with open(os.path.join(app_root, "config.json")) as f:
+            return json.load(f).get("lastKnownAccountUuid")
+    except (OSError, ValueError):
+        return None
+
+
+def same_bytes(a, b):
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        return fa.read() == fb.read()
+
+
+# ---------------------------------------------------------------- 规划
+
+def make_plan(dirs):
+    """返回 actions 列表，每项 dict(kind, dir, name, src, uid)。
+    kind: add / replace / remove / tomb / untomb"""
+    broken = set()
+    for d in dirs:
+        broken |= d.broken
+    all_ids = set()
+    for d in dirs:
+        all_ids |= set(d.sessions) | set(d.tombs)
+    all_ids -= broken
+
+    actions = []
+    final = {}  # uid -> 'live' / 'deleted'
+    for uid in sorted(all_ids):
+        vers = [(d, d.sessions[uid]) for d in dirs if uid in d.sessions]
+        tombs = [(d, d.tombs[uid]) for d in dirs if uid in d.tombs]
+        newest = max(vers, key=lambda x: (x[1]["mtime_ns"], x[1]["activity"])) if vers else None
+        tomb = max(tombs, key=lambda x: x[1]["ts"]) if tombs else None
+        deleted = tomb is not None and (
+            newest is None or tomb[1]["ts"] >= newest[1]["mtime_ns"] // 1000000)
+
+        if deleted:
+            final[uid] = "deleted"
+            for d, v in vers:
+                actions.append(dict(kind="remove", dir=d, name=session_name(uid), src=None,
+                                    uid=uid, title=v["title"]))
+            for d in dirs:
+                if uid not in d.tombs:
+                    actions.append(dict(kind="tomb", dir=d, name=tomb_name(uid),
+                                        src=tomb[1]["path"], uid=uid, title=""))
+            continue
+
+        final[uid] = "live"
+        src_dir, src = newest
+        for d in dirs:
+            cur = d.sessions.get(uid)
+            if cur is None:
+                actions.append(dict(kind="add", dir=d, name=session_name(uid), src=src["path"],
+                                    uid=uid, title=src["title"]))
+            elif d is not src_dir and not same_bytes(cur["path"], src["path"]):
+                actions.append(dict(kind="replace", dir=d, name=session_name(uid), src=src["path"],
+                                    uid=uid, title=src["title"]))
+            if uid in d.tombs:
+                actions.append(dict(kind="untomb", dir=d, name=tomb_name(uid), src=None,
+                                    uid=uid, title=src["title"]))
+    return actions, final, broken
+
+
+# ---------------------------------------------------------------- 执行
+
+class Backup(object):
+    def __init__(self, root, dry):
+        self.root = root
+        self.dry = dry
+        self.dir = None
+        self.manifest = []
+
+    def ensure(self):
+        if self.dir is None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.dir = os.path.join(self.root, stamp)
+            n = 1
+            while os.path.exists(self.dir):
+                n += 1
+                self.dir = os.path.join(self.root, "%s-%d" % (stamp, n))
+            os.makedirs(self.dir, mode=0o700)
+        return self.dir
+
+    def stash(self, rel, name, path, move=False):
+        """把现有文件存进备份目录，返回备份内的相对路径。"""
+        bdir = os.path.join(self.ensure(), rel)
+        if not os.path.isdir(bdir):
+            os.makedirs(bdir, mode=0o700)
+        dst = os.path.join(bdir, name)
+        if move:
+            shutil.move(path, dst)
+        else:
+            shutil.copy2(path, dst)
+        return os.path.join(rel, name)
+
+    def record(self, kind, rel, name, backup=None):
+        self.manifest.append(dict(kind=kind, dir=rel, name=name, backup=backup))
+
+    def save(self, sess_root):
+        if self.dir is None:
+            return
+        with open(os.path.join(self.dir, "manifest.json"), "w") as f:
+            json.dump(dict(sessions_root=sess_root, created=datetime.now().isoformat(),
+                           actions=self.manifest), f, ensure_ascii=False, indent=1)
+
+
+def atomic_copy(src, dst):
+    fd, tmp = tempfile.mkstemp(prefix=".merge-tmp-", dir=os.path.dirname(dst))
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def atomic_write(dst, text):
+    fd, tmp = tempfile.mkstemp(prefix=".merge-tmp-", dir=os.path.dirname(dst))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def apply_action(a, bk):
+    d, name = a["dir"], a["name"]
+    dst = os.path.join(d.path, name)
+    k = a["kind"]
+    if k in ("add", "tomb"):
+        atomic_copy(a["src"], dst)
+        bk.record("add", d.rel, name)
+    elif k == "replace":
+        b = bk.stash(d.rel, name, dst)
+        atomic_copy(a["src"], dst)
+        bk.record("replace", d.rel, name, b)
+    elif k in ("remove", "untomb"):
+        b = bk.stash(d.rel, name, dst, move=True)
+        bk.record("remove", d.rel, name, b)
+
+
+def rebuild_index(d, bk, dry):
+    """按目录里现有的 local_*.json 重建 archived-sessions.idx，返回是否有变化。"""
+    archived = set()
+    for p in glob.glob(os.path.join(d.path, "local_*.json")):
+        m = SESSION_RE.match(os.path.basename(p))
+        if not m:
+            continue
+        try:
+            with open(p, "rb") as f:
+                if json.loads(f.read().decode("utf-8")).get("isArchived"):
+                    archived.add("local_" + m.group(1))
+        except (ValueError, OSError):
+            pass
+    idx_path = os.path.join(d.path, IDX_NAME)
+    obj = {"v": 1, "archived": []}
+    if os.path.exists(idx_path):
+        try:
+            with open(idx_path, encoding="utf-8") as f:
+                obj = json.load(f)
+        except (ValueError, OSError):
+            pass
+    old = obj.get("archived") or []
+    if set(old) == archived:
+        return False
+    if dry:
+        return True
+    kept = [s for s in old if s in archived]
+    obj["archived"] = kept + sorted(archived - set(kept))
+    if os.path.exists(idx_path):
+        b = bk.stash(d.rel, IDX_NAME, idx_path)
+        bk.record("replace", d.rel, IDX_NAME, b)
+    else:
+        bk.record("add", d.rel, IDX_NAME)
+    atomic_write(idx_path, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+    return True
+
+
+# ---------------------------------------------------------------- 撤销
+
+def undo(which, backup_root, running):
+    if not os.path.isdir(backup_root):
+        sys.exit("还没有任何备份记录哦~")
+    stamps = sorted(x for x in os.listdir(backup_root)
+                    if os.path.exists(os.path.join(backup_root, x, "manifest.json"))
+                    and not os.path.exists(os.path.join(backup_root, x, "UNDONE")))
+    if not stamps:
+        sys.exit("没有可以撤销的合并记录。")
+    stamp = stamps[-1] if which == "latest" else os.path.basename(which.rstrip("/"))
+    bdir = os.path.join(backup_root, stamp)
+    mpath = os.path.join(bdir, "manifest.json")
+    if not os.path.exists(mpath):
+        sys.exit("找不到这次备份：%s" % bdir)
+    if running:
+        print("⚠️  Claude App 还开着，建议先 ⌘Q 退出再撤销，否则 App 可能又写回去。")
+    with open(mpath) as f:
+        man = json.load(f)
+    sess_root = man["sessions_root"]
+    trash = os.path.join(bdir, "undo-removed")
+    n = 0
+    for a in reversed(man["actions"]):
+        dst = os.path.join(sess_root, a["dir"], a["name"])
+        if a["kind"] == "add":
+            if os.path.exists(dst):
+                tdir = os.path.join(trash, a["dir"])
+                if not os.path.isdir(tdir):
+                    os.makedirs(tdir)
+                shutil.move(dst, os.path.join(tdir, a["name"]))
+                n += 1
+        else:
+            src = os.path.join(bdir, a["backup"])
+            if os.path.exists(src):
+                atomic_copy(src, dst)
+                n += 1
+    open(os.path.join(bdir, "UNDONE"), "w").close()
+    print("已撤销 %s 这次合并（恢复了 %d 个文件）。撤销时移走的文件在：%s" % (stamp, n, trash))
+
+
+# ---------------------------------------------------------------- 主流程
+
+def main():
+    ap = argparse.ArgumentParser(description="合并 Claude 桌面 App 多个账号的 Code 侧边栏会话")
+    ap.add_argument("--dry-run", action="store_true", help="只显示计划，不改任何文件")
+    ap.add_argument("--include-active", action="store_true",
+                    help="App 运行中也写入当前登录账号的目录（不推荐）")
+    ap.add_argument("--undo", nargs="?", const="latest", metavar="时间戳",
+                    help="撤销最近一次（或指定的那次）合并")
+    ap.add_argument("-v", "--verbose", action="store_true", help="列出每个新增/更新的会话标题")
+    ap.add_argument("--app-root", default=APP_ROOT, help=argparse.SUPPRESS)
+    ap.add_argument("--backup-root", default=BACKUP_ROOT, help=argparse.SUPPRESS)
+    ap.add_argument("--app-running", choices=["auto", "yes", "no"], default="auto",
+                    help=argparse.SUPPRESS)
+    args = ap.parse_args()
+
+    running = app_is_running() if args.app_running == "auto" else args.app_running == "yes"
+    if args.undo:
+        undo(args.undo, args.backup_root, running)
+        return
+
+    sess_root = os.path.join(args.app_root, "claude-code-sessions")
+    if not os.path.isdir(sess_root):
+        sys.exit("找不到会话目录：%s" % sess_root)
+    active = active_account(args.app_root)
+
+    dirs = [DirState(sess_root, rel) for rel in discover(sess_root)]
+    for d in dirs:
+        d.scan()
+    if len(dirs) < 2:
+        print("只找到一个账号目录，没有需要合并的。")
+        return
+
+    print("找到 %d 个账号/组织目录：" % len(dirs))
+    for d in dirs:
+        tag = ""
+        if d.acct == active:
+            tag = "  ← 当前登录账号"
+            if running and not args.include_active:
+                d.deferred = True
+                tag += "（App 运行中，本次不改它）"
+        print("  %s  会话 %3d 个（归档 %d）%s" % (
+            short(d.rel), len(d.sessions), sum(v["archived"] for v in d.sessions.values()), tag))
+
+    actions, final, broken = make_plan(dirs)
+    live = [u for u, s in final.items() if s == "live"]
+    print("合并后共 %d 个会话（已删除 %d 个）。" % (len(live), len(final) - len(live)))
+    if broken:
+        print("有 %d 个会话文件暂时读不出来（可能 App 正在写），本次跳过它们。" % len(broken))
+
+    bk = Backup(args.backup_root, args.dry_run)
+    print("\n计划：" if args.dry_run else "\n执行：")
+    total = 0
+    deferred_total = 0
+    for d in dirs:
+        mine = [a for a in actions if a["dir"] is d]
+        cnt = {}
+        for a in mine:
+            cnt[a["kind"]] = cnt.get(a["kind"], 0) + 1
+        if d.deferred:
+            deferred_total += len(mine)
+            note = "暂缓 %d 项（等切换账号后再跑一次，或退出 App 后跑）" % len(mine) if mine else "已是最新"
+            print("  %s  %s" % (short(d.rel), note))
+            continue
+        if not args.dry_run:
+            for a in mine:
+                apply_action(a, bk)
+        idx_changed = rebuild_index(d, bk, args.dry_run)
+        total += len(mine)
+        if not mine and not idx_changed:
+            print("  %s  已是最新" % short(d.rel))
+            continue
+        parts = []
+        for k, label in (("add", "新增"), ("replace", "更新"), ("remove", "移除"),
+                         ("tomb", "删除标记"), ("untomb", "恢复")):
+            if cnt.get(k):
+                parts.append("%s %d" % (label, cnt[k]))
+        if idx_changed:
+            parts.append("重建归档索引")
+        print("  %s  %s" % (short(d.rel), "，".join(parts)))
+        if args.verbose:
+            for a in mine:
+                if a["kind"] in ("add", "replace", "remove"):
+                    print("      %s %s" % ({"add": "+", "replace": "~", "remove": "-"}[a["kind"]],
+                                           a["title"] or a["uid"]))
+
+    if not args.dry_run:
+        bk.save(sess_root)
+    print()
+    if args.dry_run:
+        print("（这是预览，没有改动任何文件。去掉 --dry-run 就会真正合并。）")
+    elif bk.dir:
+        print("改动前的文件已备份到：%s" % bk.dir)
+        print("想撤销就运行：claude-merge-sessions --undo")
+    if total and not args.dry_run:
+        print("现在切换账号，左侧会话栏就是合并后的样子啦。如果没刷新出来，⌘Q 退出 App 再打开。")
+    elif not total and not deferred_total:
+        print("各账号的会话已经一致，不需要合并~")
+    elif not total:
+        print("其它账号都已经是最新的了~ 当前登录账号还差 %d 项，"
+              "切到别的账号后再跑一次（或 ⌘Q 退出 App 后跑）就会补上。" % deferred_total)
+
+
+if __name__ == "__main__":
+    main()
